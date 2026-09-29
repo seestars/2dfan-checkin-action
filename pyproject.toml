@@ -1,0 +1,18 @@
+[project]
+name = "2dfan-checkin"
+version = "0.1.0"
+description = "2dfan.com 自动签到工具，基于 Playwright 本地浏览器自动化"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Ming Wei" }]
+dependencies = [
+    "playwright>=1.63.0",
+    "python-dotenv>=1.0.0",
+]
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
+[project.urls]
+Repository = "https://github.com/WeMingT/2dfan-checkin"
