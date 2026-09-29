@@ -1,0 +1,38 @@
+name: 2dfan 自动签到
+
+on:
+  schedule:
+    # UTC 1:10，即北京时间每日 09:10（签到周期 00:00 重置，且避开整点高峰）
+    - cron: '10 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: latest
+
+      - name: 安装 Python 依赖
+        run: uv sync
+
+      - name: 安装 Playwright Chromium 及系统依赖
+        run: uv run playwright install --with-deps chromium
+
+      - name: 执行签到
+        env:
+          ACCOUNTS: ${{ secrets.ACCOUNTS }}
+          HEADLESS: 'true'
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: uv run python main.py

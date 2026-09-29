@@ -1,0 +1,9 @@
+**/__pycache__
+**/*_test.*
+.vscode
+.DS_Store
+.env
+.venv/
+.chrome_profile/
+debug_*.html
+debug_*.png
