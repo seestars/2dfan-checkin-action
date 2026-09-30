@@ -20,6 +20,9 @@ import logging
 import math
 import os
 import random
+import re
+import subprocess
+import sys
 import time
 
 import undetected_chromedriver as uc
@@ -164,6 +167,58 @@ class CheckinResult:
         self.checkins_count = checkins_count
         self.serial_checkins = serial_checkins
         self.user_points = user_points
+
+
+# ── Chrome 版本检测 ──────────────────────────────────────────────
+
+
+def _detect_chrome_major() -> int | None:
+    """检测本机 Chrome 主版本号。
+
+    undetected-chromedriver 默认下载最新 Stable 的 chromedriver，不检测
+    本地 Chrome 版本；当系统 Chrome 落后最新版一个大版本（如 CI runner
+    镜像）时会 session not created，因此显式检测后传 version_main。
+    检测失败返回 None，由 uc 回退到最新版。
+    """
+    if sys.platform.startswith(("linux", "cygwin")):
+        for exe in ("google-chrome", "google-chrome-stable",
+                    "chromium", "chromium-browser"):
+            try:
+                out = subprocess.check_output(
+                    [exe, "--version"], stderr=subprocess.DEVNULL, timeout=15
+                ).decode()
+            except (OSError, subprocess.SubprocessError):
+                continue
+            m = re.search(r"(\d+)\.", out)
+            if m:
+                return int(m.group(1))
+        return None
+
+    if sys.platform == "darwin":
+        exe = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        try:
+            out = subprocess.check_output(
+                [exe, "--version"], stderr=subprocess.DEVNULL, timeout=15
+            ).decode()
+        except (OSError, subprocess.SubprocessError):
+            return None
+        m = re.search(r"(\d+)\.", out)
+        return int(m.group(1)) if m else None
+
+    # Windows：Chrome Application 目录下有以完整版本号命名的文件夹
+    roots = [
+        os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+        os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+        os.environ.get("LOCALAPPDATA", ""),
+    ]
+    for root in roots:
+        app_dir = os.path.join(root, "Google", "Chrome", "Application")
+        if not os.path.isdir(app_dir):
+            continue
+        for name in os.listdir(app_dir):
+            if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", name):
+                return int(name.split(".")[0])
+    return None
 
 
 # ── CDP 鼠标（视口坐标，时序由 Python 端控制）────────────────────
@@ -350,13 +405,20 @@ def checkin(user_id: str, session_cookie: str) -> CheckinResult | None:
     """
     headless = os.environ.get("HEADLESS", "").lower() in ("1", "true", "yes")
 
+    version_main = _detect_chrome_major()
+    logger.info("本机 Chrome 主版本: %s", version_main or "未检测到（用最新）")
+
     options = uc.ChromeOptions()
     options.add_argument("--window-size=1280,900")
     options.add_argument("--no-first-run")
 
     driver = None
     try:
-        driver = _StealthChrome(options=options, headless=headless)
+        driver = _StealthChrome(
+            options=options,
+            headless=headless,
+            version_main=version_main,
+        )
         driver.set_page_load_timeout(120)
         driver.set_script_timeout(30)
 
