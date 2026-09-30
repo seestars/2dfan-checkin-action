@@ -1,4 +1,3 @@
-import asyncio
 import html
 import json
 import logging
@@ -10,18 +9,6 @@ from dotenv import load_dotenv
 
 from api import checkin
 from notify import send_telegram
-
-# 抑制 Windows asyncio 管道关闭时的 __del__ 异常
-_orig_hook = sys.unraisablehook
-
-
-def _quiet_hook(args):
-    if isinstance(args.exc_value, ValueError) and "closed pipe" in str(args.exc_value):
-        return
-    _orig_hook(args)
-
-
-sys.unraisablehook = _quiet_hook
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,7 +32,7 @@ def load_accounts() -> list[Account]:
     return [Account(user_id=str(a["user_id"]), session=a["session"]) for a in raw]
 
 
-async def main() -> int:
+def main() -> int:
     load_dotenv()
     accounts = load_accounts()
     logger.info("共 %d 个账号待签到", len(accounts))
@@ -56,7 +43,7 @@ async def main() -> int:
     for i, acc in enumerate(accounts, 1):
         logger.info("── 账号 %d/%d (ID: %s) ──", i, len(accounts), acc.user_id)
         try:
-            result = await checkin(acc.user_id, acc.session)
+            result = checkin(acc.user_id, acc.session)
             if result:
                 msg = (
                     f"签到成功！累计: {result.checkins_count}, "
@@ -97,4 +84,4 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    sys.exit(main())

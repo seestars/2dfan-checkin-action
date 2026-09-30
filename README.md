@@ -1,6 +1,8 @@
 # 2dfan 自动签到
 
-使用 [Playwright](https://playwright.dev/python/) 自动化 Chrome 完成 2dfan.com 签到，自动处理 Cloudflare 挑战，以及 Turnstile / 阿里云滑块人机验证。支持多账号、GitHub Actions 定时运行、Telegram 结果推送。
+使用 [Selenium](https://www.selenium.dev/) + [undetected-chromedriver](https://github.com/ultrafunkamsterdam/undetected-chromedriver) 自动化 Chrome 完成 2dfan.com 签到，自动处理 Cloudflare 挑战，以及 Turnstile / 阿里云滑块人机验证。支持多账号、GitHub Actions 定时运行、Telegram 结果推送。
+
+> **为什么不用 headless 浏览器？** Cloudflare 对 headless Chrome（包括无头模式下的各类 stealth 补丁）检测非常严格。undetected-chromedriver 通过补丁 chromedriver 消除自动化特征，配合**有头模式**运行通过率最高。因此云端使用 [Xvfb](https://en.wikipedia.org/wiki/Xvfb) 虚拟显示器让 Chrome 以有头模式运行，而不是开启 headless。
 
 ## 本地使用
 
@@ -10,7 +12,7 @@
 uv sync
 ```
 
-本地运行需安装 [Chrome](https://www.google.com/chrome/)（程序优先调用系统 Chrome，找不到时自动降级为 Playwright 内置 Chromium）。
+本地运行需安装 [Chrome](https://www.google.com/chrome/)（undetected-chromedriver 会自动下载并补丁匹配版本的 chromedriver，首次运行需联网）。
 
 ### 2. 配置
 
@@ -24,7 +26,7 @@ ACCOUNTS=[{"user_id":"123","session":"xxx"},{"user_id":"456","session":"yyy"}]
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 TELEGRAM_CHAT_ID=123456789
 
-# 无头模式（可选）
+# 无头模式（可选，默认有头；仅本机调试时使用）
 HEADLESS=false
 ```
 
@@ -69,9 +71,9 @@ uv run python main.py
    | `TELEGRAM_BOT_TOKEN` | Telegram 机器人 token | 否 |
    | `TELEGRAM_CHAT_ID` | 接收消息的 chat_id（多个逗号分隔） | 否 |
 
-3. 工作流默认每天 **北京时间 00:10** 自动运行（对应 UTC 16:10），也可在 **Actions → 2dfan 自动签到 → Run workflow** 手动触发。
+3. 工作流默认每天 **北京时间 09:10** 自动运行（对应 UTC 1:10），也可在 **Actions → 2dfan 自动签到 → Run workflow** 手动触发。工作流通过 `xvfb-run` 启动有头 Chrome；签到失败时会自动上传 `debug_*.png/.html` 快照为 Artifact，便于排查。
 
-> 提示：GitHub 机房 IP 触发人机验证的概率高于本地，若云端验证频繁失败，可调整 workflow 中的 cron 多跑一次，或改在本机/家用服务器定时运行。
+> 提示：Cloudflare 的判定与 IP 信誉强相关，GitHub 机房 IP 触发人机验证的概率高于家庭宽带。若云端验证仍频繁失败，可调整 workflow 中的 cron 多跑一次，或改在本机/家用服务器定时运行。
 
 ## 免责声明
 

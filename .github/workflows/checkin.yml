@@ -22,17 +22,30 @@ jobs:
         uses: astral-sh/setup-uv@v10.2.0
         with:
           version: latest
+          python-version: "3.13"
 
       - name: 安装 Python 依赖
         run: uv sync
 
-      - name: 安装 Playwright Chromium 及系统依赖
-        run: uv run playwright install --with-deps chromium
+      - name: 安装 Xvfb（有头模式所需）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          google-chrome --version
 
-      - name: 执行签到
+      - name: 执行签到（Xvfb 虚拟显示器，Chrome 以有头模式运行）
         env:
           ACCOUNTS: ${{ secrets.ACCOUNTS }}
-          HEADLESS: 'true'
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: uv run python main.py
+        run: xvfb-run -a -s "-screen 0 1920x1080x24" uv run python main.py
+
+      - name: 上传调试快照（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-snapshots
+          path: |
+            debug_*.png
+            debug_*.html
+          if-no-files-found: ignore
