@@ -17,7 +17,6 @@
 
 import json
 import logging
-import math
 import os
 import random
 import re
@@ -27,7 +26,9 @@ import time
 
 import undetected_chromedriver as uc
 from selenium.common.exceptions import JavascriptException, WebDriverException
+from selenium.webdriver import ActionChains
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 
 logger = logging.getLogger(__name__)
 
@@ -35,22 +36,45 @@ CHECKIN_URL = "https://2dfan.com/checkin"
 _CF_TITLES = ("Just a moment", "请稍候")
 _CF_WAIT = 90              # 等待 Cloudflare 挑战通过（秒）
 _CAPTCHA_WAIT = 30         # 等待人机验证组件出现（秒）
-_CONFIRM_WAIT = 15         # 滑块后等待确认按钮可用（秒）
+_CONFIRM_WAIT = 16         # 滑块后等待确认按钮可用（每 0.5s 轮询）
 _POST_WAIT = 20            # 点击确认后等待 POST 响应（秒）
+_MODAL_WAIT = 10           # 等待人机验证弹窗挂载（每 0.5s 轮询）
 _SLIDER_RETRIES = 3
-_SUBMIT_RETRIES = 2
+_SUBMIT_RETRIES = 3        # 每轮重开弹窗、获取全新验证组件
 
 # ── 注入页面的 JS ─────────────────────────────────────────────────
 
-# hook fetch / XHR，记录 POST /checkin 的响应到 window.__checkinResponses
+# hook fetch / XHR：
+#   window.__checkinResponses — POST /checkin 的请求体 + 响应（请求体用于判断
+#                               提交时验证码参数是否真的存在，不记录完整 token）
+#   window.__captchaNet       — 阿里云验证码相关的跨域请求，便于定位风控拒绝
 _HOOK_JS = """
 window.__checkinResponses = [];
+window.__captchaNet = [];
 (function () {
-  function record(method, url, status, body) {
+  function recordCheckin(url, reqBody, status, body) {
     try {
-      if (String(method).toUpperCase() === 'POST'
-          && String(url).indexOf('/checkin') !== -1) {
-        window.__checkinResponses.push({status: status, body: body});
+      if (String(url).indexOf('/checkin') !== -1) {
+        window.__checkinResponses.push({
+          status: status,
+          reqBody: reqBody == null ? null : String(reqBody).slice(0, 2000),
+          body: body == null ? null : String(body).slice(0, 2000)
+        });
+      }
+    } catch (e) {}
+  }
+  function recordCaptchaNet(method, url, status, body) {
+    try {
+      var u = String(url);
+      if (u.indexOf('2dfan.com') === -1
+          && (u.indexOf('aliyun') !== -1 || u.indexOf('captcha') !== -1
+              || u.indexOf('nvc') !== -1)) {
+        window.__captchaNet.push({
+          method: String(method).toUpperCase(),
+          url: u.slice(0, 300),
+          status: status,
+          body: body == null ? null : String(body).slice(0, 500)
+        });
       }
     } catch (e) {}
   }
@@ -61,12 +85,16 @@ window.__checkinResponses = [];
         || (input && input.method) || 'GET';
       var url = typeof input === 'string' ? input
         : (input && input.url) || '';
+      var reqBody = init && init.body;
       return origFetch.apply(this, arguments).then(function (resp) {
         if (String(method).toUpperCase() === 'POST') {
           resp.clone().text().then(function (t) {
-            record(method, url, resp.status, t);
-          });
+            recordCheckin(url, reqBody, resp.status, t);
+          }).catch(function () {});
         }
+        resp.clone().text().then(function (t) {
+          recordCaptchaNet(method, url, resp.status, t);
+        }).catch(function () {});
         return resp;
       });
     };
@@ -78,10 +106,15 @@ window.__checkinResponses = [];
     this.__url = url;
     return origOpen.apply(this, arguments);
   };
-  XMLHttpRequest.prototype.send = function () {
+  XMLHttpRequest.prototype.send = function (body) {
     var xhr = this;
     xhr.addEventListener('load', function () {
-      record(xhr.__method, xhr.__url, xhr.status, xhr.responseText);
+      var t = '';
+      try { t = xhr.responseText; } catch (e) {}
+      if (String(xhr.__method).toUpperCase() === 'POST') {
+        recordCheckin(xhr.__url, body, xhr.status, t);
+      }
+      recordCaptchaNet(xhr.__method, xhr.__u || xhr.__url, xhr.status, t);
     });
     return origSend.apply(this, arguments);
   };
@@ -106,14 +139,16 @@ const slider = document.getElementById('aliyunCaptcha-sliding-slider');
 const sr = slider ? slider.getBoundingClientRect() : null;
 return {
     turnstileToken: ts ? ts.value : null,
-    sliderVisible: !!(sr && sr.width > 0 && sr.height > 0)
+    sliderVisible: !!(sr && sr.width > 0 && sr.height > 0),
+    modalMounted: !!document.querySelector('.captcha-render-area')
 };
 """
 
-# 确认按钮状态 + 滑块失败提示
+# 确认按钮状态（限定在验证弹窗内）+ 滑块失败提示
 _CONFIRM_STATE_JS = """
-const btn = [...document.querySelectorAll('button')].find(
-    b => b.textContent.trim() === '确认');
+const modal = [...document.querySelectorAll('.n-modal')].pop();
+const btn = modal ? [...modal.querySelectorAll('button')].find(
+    b => b.textContent.trim() === '确认') : null;
 const fail = document.getElementById('aliyunCaptcha-sliding-failTip');
 return {
     enabled: btn ? !btn.disabled : false,
@@ -291,6 +326,109 @@ def _get_status(driver) -> dict:
 # ── 阿里云滑块拖动 ───────────────────────────────────────────────
 
 
+def _drag_path(x0: float, y0: float, distance: float):
+    """生成拟人拖动轨迹，返回 (轨迹名称, [(x, y, 停留秒), ...])。
+
+    三种轨迹随机切换，避免固定轨迹被风控指纹化：
+      ease      先快后慢一次到位
+      overshoot 轻微冲过头再回拉（真人常见动作）
+      stall     中途停顿后继续
+    """
+    profile = random.choices(
+        ("ease", "overshoot", "stall"), weights=(5, 3, 2)
+    )[0]
+    points: list[tuple[float, float, float]] = []
+    drift = 0.0  # y 轴随机游走累计偏移
+
+    def push(x: float, lo: float = 0.012, hi: float = 0.04) -> None:
+        nonlocal drift
+        drift += random.uniform(-0.9, 0.9)
+        drift = max(-3.5, min(3.5, drift))
+        points.append((x, y0 + drift, random.uniform(lo, hi)))
+
+    if profile == "overshoot":
+        target = distance * random.uniform(1.02, 1.045)
+        steps = random.randint(26, 38)
+        for i in range(1, steps + 1):
+            p = i / steps
+            push(x0 + target * (1 - (1 - p) ** 3))
+        points.append((x0 + target, y0 + drift, random.uniform(0.18, 0.45)))
+        back = random.randint(7, 12)
+        for i in range(1, back + 1):
+            p = i / back
+            push(x0 + target + (distance - target) * p, 0.015, 0.04)
+    elif profile == "stall":
+        split = random.uniform(0.55, 0.72)
+        steps1 = random.randint(16, 24)
+        for i in range(1, steps1 + 1):
+            p = i / steps1
+            push(x0 + distance * split * (1 - (1 - p) ** 2))
+        points.append(
+            (x0 + distance * split, y0 + drift, random.uniform(0.35, 0.9))
+        )
+        steps2 = random.randint(16, 26)
+        for i in range(1, steps2 + 1):
+            p = i / steps2
+            base = distance * split
+            push(x0 + base + (distance - base) * (1 - (1 - p) ** 3))
+    else:
+        steps = random.randint(30, 48)
+        for i in range(1, steps + 1):
+            p = i / steps
+            push(x0 + distance * (1 - (1 - p) ** 3))
+
+    return profile, points
+
+
+def _drag_once(driver, box: dict) -> str:
+    """执行一次滑块拖动，返回轨迹名称。"""
+    x0, y0 = box["x0"], box["y0"]
+    distance = box["end"] - box["start"] + random.uniform(0, 2)
+    profile, points = _drag_path(x0, y0, distance)
+
+    # 从附近随机位置移入滑块（真人光标不会直接出现在手柄上）
+    _cdp_mouse(driver, "mouseMoved",
+               x0 + random.uniform(-70, 70), y0 + random.uniform(-30, 30))
+    time.sleep(random.uniform(0.05, 0.15))
+    _cdp_mouse(driver, "mouseMoved",
+               x0 + random.uniform(-25, 25), y0 + random.uniform(-10, 10))
+    time.sleep(random.uniform(0.05, 0.15))
+    _cdp_mouse(driver, "mouseMoved", x0, y0)
+    time.sleep(random.uniform(0.08, 0.25))  # 按下前的短暂犹豫
+
+    _cdp_mouse(driver, "mousePressed", x0, y0)
+    for x, y, delay in points:
+        _cdp_mouse(driver, "mouseMoved", x, y)
+        time.sleep(delay)
+
+    final_x = points[-1][0]
+    _cdp_mouse(driver, "mouseMoved", final_x, y0)
+    time.sleep(random.uniform(0.1, 0.2))
+    _cdp_mouse(driver, "mouseReleased", final_x, y0)
+    return profile
+
+
+def _wait_slider_ready(driver):
+    """滑块释放后等待确认按钮可用。
+
+    Returns:
+        (True, "")      按钮连续可用（排除“假就绪”）
+        (False, fail)   出现滑块失败提示
+        (None, "")      等待超时
+    """
+    enabled_for = 0
+    for _ in range(_CONFIRM_WAIT):
+        state = driver.execute_script(_CONFIRM_STATE_JS)
+        if state["fail"]:
+            return False, state["fail"]
+        if state["enabled"]:
+            enabled_for += 1
+            if enabled_for >= 2:
+                return True, ""
+        time.sleep(0.5)
+    return None, ""
+
+
 def _drag_slider(driver) -> None:
     """拟人拖动阿里云无缺口滑块，失败自动重试。"""
     for attempt in range(1, _SLIDER_RETRIES + 1):
@@ -304,37 +442,16 @@ def _drag_slider(driver) -> None:
             time.sleep(1)
             continue
 
-        x0, y0 = box["x0"], box["y0"]
-        distance = box["end"] - box["start"] + 2
+        profile = _drag_once(driver, box)
+        logger.info("本次拖动轨迹: %s", profile)
 
-        _cdp_mouse(driver, "mouseMoved", x0, y0)
-        time.sleep(random.uniform(0.1, 0.3))
-        _cdp_mouse(driver, "mousePressed", x0, y0)
-
-        # 先快后慢的 ease-out 轨迹 + 轻微抖动，模拟真人
-        steps = random.randint(35, 50)
-        for i in range(1, steps + 1):
-            p = i / steps
-            ease = 1 - (1 - p) ** 3
-            x = x0 + distance * ease + random.uniform(-1, 1)
-            y = y0 + math.sin(p * math.pi) * 2 + random.uniform(-1, 1)
-            _cdp_mouse(driver, "mouseMoved", x, y)
-            time.sleep(random.uniform(0.012, 0.04))
-
-        _cdp_mouse(driver, "mouseMoved", x0 + distance, y0)
-        time.sleep(0.15)
-        _cdp_mouse(driver, "mouseReleased", x0 + distance, y0)
-
-        # 等待确认按钮可用（captchaReady）
-        for _ in range(_CONFIRM_WAIT):
-            state = driver.execute_script(_CONFIRM_STATE_JS)
-            if state["enabled"]:
-                logger.info("滑块验证通过")
-                return
-            if state["fail"]:
-                logger.warning("滑块验证失败: %s", state["fail"])
-                break
-            time.sleep(1)
+        ok, msg = _wait_slider_ready(driver)
+        if ok is True:
+            logger.info("滑块验证通过")
+            return
+        if ok is False:
+            logger.warning("滑块验证失败: %s，准备重试", msg)
+            time.sleep(random.uniform(0.5, 1.2))
 
     raise RuntimeError("阿里云滑块验证多次失败")
 
@@ -342,25 +459,90 @@ def _drag_slider(driver) -> None:
 # ── 人机验证 ─────────────────────────────────────────────────────
 
 
-def _solve_captcha(driver) -> None:
-    """等待 Turnstile 自动解决；Turnstile 失败切换为阿里云滑块后自动拖动。"""
+def _solve_captcha(driver) -> bool:
+    """等待 Turnstile 自动解决；Turnstile 失败切换为阿里云滑块后自动拖动。
+
+    Returns:
+        True   验证完成，可以点击确认
+        False  弹窗未挂载或验证组件始终未出现（调用方应重开弹窗重试）
+    """
     clicked = False
     for sec in range(_CAPTCHA_WAIT):
         state = driver.execute_script(_CAPTCHA_STATE_JS)
+        if not state.get("modalMounted"):
+            return False
         if state.get("turnstileToken"):
             logger.info("Turnstile 已自动解决（%ds）", sec)
-            return
+            return True
         if state.get("sliderVisible"):
             logger.info("Turnstile 未通过，已切换阿里云滑块")
             _drag_slider(driver)
-            return
+            return True
         # 超过 8s 无 token，尝试点击 widget 中的 checkbox（仅一次）
         if not clicked and sec >= 8:
             clicked = _click_turnstile_checkbox(driver)
         if sec % 5 == 0:
             logger.info("等待人机验证组件... (%d/%ds)", sec, _CAPTCHA_WAIT)
         time.sleep(1)
-    raise RuntimeError("人机验证组件未出现")
+    return False
+
+
+# ── 人机验证弹窗生命周期 ─────────────────────────────────────────
+
+
+def _modal_open(driver) -> bool:
+    """验证弹窗是否已挂载（Naive UI 默认 display-directive=if，关闭即卸载）。"""
+    return bool(driver.execute_script(
+        "return !!document.querySelector('.captcha-render-area');"
+    ))
+
+
+def _open_captcha_modal(driver) -> None:
+    """点击签到页「签到」按钮，打开人机验证弹窗。"""
+    btns = driver.find_elements(By.CSS_SELECTOR, "button.n-button--large-type")
+    if not btns:
+        raise RuntimeError("找不到签到按钮，页面可能未正确加载")
+    try:
+        btns[0].click()
+    except WebDriverException:
+        driver.execute_script("arguments[0].click();", btns[0])
+
+    for _ in range(_MODAL_WAIT):
+        if _modal_open(driver):
+            return
+        time.sleep(0.5)
+    raise RuntimeError("人机验证弹窗未打开")
+
+
+def _close_captcha_modal(driver) -> None:
+    """关闭残留的验证弹窗：优先右上角关闭按钮，其次 Esc。"""
+    if not _modal_open(driver):
+        return
+    try:
+        closers = driver.find_elements(
+            By.CSS_SELECTOR,
+            ".n-modal .n-base-close, .n-modal .n-card-header__close",
+        )
+        for closer in closers:
+            if closer.is_displayed():
+                closer.click()
+                break
+    except WebDriverException:
+        pass
+
+    for _ in range(_MODAL_WAIT):
+        if not _modal_open(driver):
+            return
+        time.sleep(0.3)
+
+    try:
+        ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+    except WebDriverException:
+        pass
+    for _ in range(_MODAL_WAIT):
+        if not _modal_open(driver):
+            return
+        time.sleep(0.3)
 
 
 # ── 提交签到 ─────────────────────────────────────────────────────
@@ -369,9 +551,18 @@ def _solve_captcha(driver) -> None:
 def _click_confirm(driver) -> dict | None:
     """点击弹窗「确认」，返回页面 hook 捕获的 POST /checkin 响应。"""
     driver.execute_script("window.__checkinResponses = [];")
-    btn = driver.find_element(
-        By.XPATH, "//button[normalize-space()='确认']"
+
+    btn = None
+    candidates = driver.find_elements(
+        By.CSS_SELECTOR, ".n-modal .n-button--primary-type"
     )
+    if candidates:
+        btn = candidates[0]
+    if btn is None:
+        btn = driver.find_element(
+            By.XPATH, "//button[normalize-space()='确认']"
+        )
+
     try:
         btn.click()
     except WebDriverException:
@@ -385,9 +576,44 @@ def _click_confirm(driver) -> dict | None:
                 data = json.loads(r["body"])
             except (json.JSONDecodeError, TypeError):
                 data = None
-            return {"status": r["status"], "body": r["body"], "json": data}
+            return {
+                "status": r["status"],
+                "body": r["body"],
+                "reqBody": r.get("reqBody"),
+                "json": data,
+            }
         time.sleep(1)
     return None
+
+
+def _summarize_submit(result: dict) -> str:
+    """把一次提交结果压缩成一行日志（不输出完整验证码 token）。"""
+    parts = [f"status={result['status']} body={str(result['body'])[:120]}"]
+    req = result.get("reqBody")
+    if req:
+        try:
+            data = json.loads(req)
+            fields = ", ".join(
+                f"{k}=<{len(str(v))}字符>" for k, v in data.items()
+            )
+            parts.append("提交字段: " + fields)
+        except (json.JSONDecodeError, TypeError):
+            parts.append(f"reqBody={str(req)[:120]}")
+    return "; ".join(parts)
+
+
+def _log_captcha_net(driver) -> None:
+    """输出阿里云验证相关的跨域请求摘要，辅助定位风控拒绝。"""
+    try:
+        net = driver.execute_script("return window.__captchaNet;") or []
+    except WebDriverException:
+        net = []
+    for item in net[-10:]:
+        logger.info(
+            "验证网络: %s %s status=%s body=%.150s",
+            item.get("method"), item.get("url"),
+            item.get("status"), item.get("body") or "",
+        )
 
 
 # ── 主入口 ───────────────────────────────────────────────────────
@@ -455,15 +681,20 @@ def checkin(user_id: str, session_cookie: str) -> CheckinResult | None:
             logger.info("今日已签到")
             return None
 
-        # 打开人机验证弹窗
-        btns = driver.find_elements(By.CSS_SELECTOR, "button.n-button--large-type")
-        if not btns:
-            raise RuntimeError("找不到签到按钮，页面可能未正确加载")
-        btns[0].click()
-
+        last_detail = "未知错误"
         for round_ in range(1, _SUBMIT_RETRIES + 1):
-            _solve_captcha(driver)
-            result = _click_confirm(driver)
+            result = None
+            try:
+                # 页面在点击确认时无论 POST 成败都会关闭弹窗，
+                # 因此每轮都（重新）打开弹窗，获取全新的验证组件
+                if not _modal_open(driver):
+                    _open_captcha_modal(driver)
+                if not _solve_captcha(driver):
+                    raise RuntimeError("人机验证组件未出现")
+                result = _click_confirm(driver)
+            except Exception as captcha_err:
+                last_detail = str(captcha_err)
+                _close_captcha_modal(driver)
 
             if result and result["status"] == 200 and result["json"]:
                 j = result["json"]
@@ -489,14 +720,14 @@ def checkin(user_id: str, session_cookie: str) -> CheckinResult | None:
                 logger.info("未捕获 POST 响应，但状态显示已签到")
                 return fallback
 
-            body = result["body"] if result else "<未捕获 POST 响应>"
-            code = result["status"] if result else "-"
+            detail = _summarize_submit(result) if result else last_detail
             logger.warning(
-                "提交失败（%d/%d）: status=%s body=%.200s",
-                round_, _SUBMIT_RETRIES, code, body,
+                "提交失败（%d/%d）: %s", round_, _SUBMIT_RETRIES, detail
             )
+            _close_captcha_modal(driver)
 
-        raise RuntimeError("签到提交多次失败")
+        _log_captcha_net(driver)
+        raise RuntimeError(f"签到提交多次失败: {last_detail}")
 
     except Exception:
         # 保存调试快照
