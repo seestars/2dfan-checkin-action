@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 安装 uv
         uses: astral-sh/setup-uv@v10.2.0
@@ -42,7 +42,7 @@ jobs:
 
       - name: 上传调试快照（失败时）
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: debug-snapshots
           path: |

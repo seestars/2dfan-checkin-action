@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: quark-heartbeat-${{ github.repository }}
+  group: 2dfan-checkin-keepalive-${{ github.repository }}
   cancel-in-progress: false
 
 env:
