@@ -2,7 +2,8 @@
 
 流程：启动 stealth Chrome → CDP 预置 session cookie → 打开 /checkin
      → 通过 Cloudflare（Turnstile 由 uc 伪装 + 有头模式自动解决）
-     → 读取 status.json → 完成人机验证（Turnstile 自动解决 / 阿里云滑块自动拖动）
+     → 读取 status.json → 点击签到（直提或弹窗）
+     → 弹窗时完成人机验证（Turnstile / 阿里云滑块；站点未启用验证则跳过）
      → 点击确认提交 POST /checkin（页面内 hook 捕获响应）
 
 签到页面为 Vue（Naive UI）应用，签到接口：
@@ -132,23 +133,53 @@ fetch(path, {
 ).catch(e => cb({status: 0, body: String(e)}));
 """
 
-# 人机验证组件状态
+# 无弹窗场景直接 POST /checkin（站点未启用人机验证时接受空 JSON）
+_DIRECT_POST_JS = """
+const cb = arguments[arguments.length - 1];
+const meta = document.querySelector('meta[name="csrf-token"]');
+const headers = {
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+    'X-Requested-With': 'XMLHttpRequest'
+};
+if (meta && meta.content) headers['X-CSRF-Token'] = meta.content;
+fetch('/checkin', {
+    method: 'POST',
+    headers: headers,
+    credentials: 'same-origin',
+    body: JSON.stringify({})
+}).then(r => r.text().then(body => cb({status: r.status, body: body}))
+).catch(e => cb({status: 0, body: String(e)}));
+"""
+
+# 人机验证组件状态（captchaPresent 为假表示站点暂未启用验证，可直接确认）
 _CAPTCHA_STATE_JS = """
 const ts = document.querySelector('input[name="cf-turnstile-response"]');
 const slider = document.getElementById('aliyunCaptcha-sliding-slider');
 const sr = slider ? slider.getBoundingClientRect() : null;
+const tsIframe = [...document.querySelectorAll('iframe')]
+    .some(x => x.src.includes('challenges.cloudflare.com'));
 return {
     turnstileToken: ts ? ts.value : null,
     sliderVisible: !!(sr && sr.width > 0 && sr.height > 0),
-    modalMounted: !!document.querySelector('.captcha-render-area')
+    modalMounted: !!document.querySelector('.n-modal'),
+    captchaPresent: !!(
+        document.querySelector('.captcha-render-area')
+        || tsIframe
+        || (sr && sr.width > 0 && sr.height > 0)
+        || (ts && ts.value)
+    )
 };
 """
 
 # 确认按钮状态（限定在验证弹窗内）+ 滑块失败提示
 _CONFIRM_STATE_JS = """
 const modal = [...document.querySelectorAll('.n-modal')].pop();
-const btn = modal ? [...modal.querySelectorAll('button')].find(
-    b => b.textContent.trim() === '确认') : null;
+const btn = modal ? (
+    [...modal.querySelectorAll('button')].find(
+        b => b.textContent.trim() === '确认')
+    || modal.querySelector('.n-button--primary-type')
+) : null;
 const fail = document.getElementById('aliyunCaptcha-sliding-failTip');
 return {
     enabled: btn ? !btn.disabled : false,
@@ -460,16 +491,19 @@ def _drag_slider(driver) -> None:
 
 
 def _solve_captcha(driver) -> bool:
-    """等待 Turnstile 自动解决；Turnstile 失败切换为阿里云滑块后自动拖动。
+    """完成人机验证；站点暂未启用验证时直接放行。
 
-    Returns:
-        True   验证完成，可以点击确认
-        False  弹窗未挂载或验证组件始终未出现（调用方应重开弹窗重试）
+    - captchaPresent 为假且出现「确认」按钮：视为无需验证，返回 True
+    - Turnstile 自动出 token / 切换阿里云滑块：走原有求解逻辑
+    - 弹窗未挂载：返回 False（调用方应重开弹窗重试）
     """
     clicked = False
+    no_captcha_seen = 0
     for sec in range(_CAPTCHA_WAIT):
         state = driver.execute_script(_CAPTCHA_STATE_JS)
         if not state.get("modalMounted"):
+            if _checkin_response_ready(driver):
+                return True
             return False
         if state.get("turnstileToken"):
             logger.info("Turnstile 已自动解决（%ds）", sec)
@@ -478,8 +512,17 @@ def _solve_captcha(driver) -> bool:
             logger.info("Turnstile 未通过，已切换阿里云滑块")
             _drag_slider(driver)
             return True
+        if not state.get("captchaPresent"):
+            no_captcha_seen += 1
+            if no_captcha_seen >= 3:
+                confirm = driver.execute_script(_CONFIRM_STATE_JS)
+                if confirm.get("enabled"):
+                    logger.info("无人机验证组件，直接确认")
+                    return True
+        else:
+            no_captcha_seen = 0
         # 超过 8s 无 token，尝试点击 widget 中的 checkbox（仅一次）
-        if not clicked and sec >= 8:
+        if not clicked and sec >= 8 and state.get("captchaPresent"):
             clicked = _click_turnstile_checkbox(driver)
         if sec % 5 == 0:
             logger.info("等待人机验证组件... (%d/%ds)", sec, _CAPTCHA_WAIT)
@@ -491,14 +534,59 @@ def _solve_captcha(driver) -> bool:
 
 
 def _modal_open(driver) -> bool:
-    """验证弹窗是否已挂载（Naive UI 默认 display-directive=if，关闭即卸载）。"""
+    """验证/确认弹窗是否已挂载（Naive UI 默认 display-directive=if，关闭即卸载）。"""
     return bool(driver.execute_script(
-        "return !!document.querySelector('.captcha-render-area');"
+        "return !!document.querySelector('.captcha-render-area, .n-modal');"
     ))
 
 
-def _open_captcha_modal(driver) -> None:
-    """点击签到页「签到」按钮，打开人机验证弹窗。"""
+def _checkin_response_ready(driver) -> bool:
+    """页面 hook 是否已捕获 POST /checkin 响应（签到按钮直提场景）。"""
+    try:
+        resps = driver.execute_script("return window.__checkinResponses;") or []
+    except WebDriverException:
+        return False
+    return bool(resps)
+
+
+def _take_checkin_response(driver) -> dict | None:
+    """取出 hook 捕获的最近一次 POST /checkin 响应（与 _click_confirm 同构）。"""
+    resps = driver.execute_script("return window.__checkinResponses;") or []
+    if not resps:
+        return None
+    r = resps[-1]
+    try:
+        data = json.loads(r["body"])
+    except (json.JSONDecodeError, TypeError):
+        data = None
+    return {
+        "status": r["status"],
+        "body": r["body"],
+        "reqBody": r.get("reqBody"),
+        "json": data,
+    }
+
+
+def _post_checkin_direct(driver) -> dict | None:
+    """无弹窗/无验证场景，页面内直接 POST /checkin（空 JSON body）。"""
+    raw = driver.execute_async_script(_DIRECT_POST_JS)
+    if not raw or raw.get("status") == 0:
+        logger.warning("直接 POST /checkin 失败: %s", raw)
+        return None
+    try:
+        data = json.loads(raw["body"])
+    except (json.JSONDecodeError, TypeError):
+        data = None
+    return {"status": raw["status"], "body": raw["body"], "reqBody": None, "json": data}
+
+
+def _open_captcha_modal(driver) -> bool:
+    """点击签到页「签到」按钮。
+
+    Returns:
+        True   弹窗已打开，或点击后已直接产生 POST /checkin 响应
+        False  两者都未出现（调用方决定是否报错）
+    """
     btns = driver.find_elements(By.CSS_SELECTOR, "button.n-button--large-type")
     if not btns:
         raise RuntimeError("找不到签到按钮，页面可能未正确加载")
@@ -508,10 +596,10 @@ def _open_captcha_modal(driver) -> None:
         driver.execute_script("arguments[0].click();", btns[0])
 
     for _ in range(_MODAL_WAIT):
-        if _modal_open(driver):
-            return
+        if _modal_open(driver) or _checkin_response_ready(driver):
+            return True
         time.sleep(0.5)
-    raise RuntimeError("人机验证弹窗未打开")
+    return False
 
 
 def _close_captcha_modal(driver) -> None:
@@ -619,6 +707,23 @@ def _log_captcha_net(driver) -> None:
 # ── 主入口 ───────────────────────────────────────────────────────
 
 
+def _find_local_chromedriver() -> str | None:
+    """优先使用本地 chromedriver，避免 uc 每次联网下载（网络不稳时会失败）。
+
+    查找顺序：环境变量 CHROMEDRIVER_PATH → 项目下 .chromedriver/chromedriver*.exe
+    """
+    env_path = os.environ.get("CHROMEDRIVER_PATH", "").strip()
+    if env_path and os.path.isfile(env_path):
+        return env_path
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chromedriver")
+    if os.path.isdir(base):
+        for root, _dirs, files in os.walk(base):
+            for name in files:
+                if name.lower() in ("chromedriver.exe", "chromedriver"):
+                    return os.path.join(root, name)
+    return None
+
+
 def checkin(user_id: str, session_cookie: str) -> CheckinResult | None:
     """
     执行 2dfan.com 签到。
@@ -634,6 +739,10 @@ def checkin(user_id: str, session_cookie: str) -> CheckinResult | None:
     version_main = _detect_chrome_major()
     logger.info("本机 Chrome 主版本: %s", version_main or "未检测到（用最新）")
 
+    local_driver = _find_local_chromedriver()
+    if local_driver:
+        logger.info("使用本地 chromedriver: %s", local_driver)
+
     options = uc.ChromeOptions()
     options.add_argument("--window-size=1280,900")
     options.add_argument("--no-first-run")
@@ -642,6 +751,7 @@ def checkin(user_id: str, session_cookie: str) -> CheckinResult | None:
     try:
         driver = _StealthChrome(
             options=options,
+            driver_executable_path=local_driver,
             headless=headless,
             version_main=version_main,
         )
@@ -687,11 +797,28 @@ def checkin(user_id: str, session_cookie: str) -> CheckinResult | None:
             try:
                 # 页面在点击确认时无论 POST 成败都会关闭弹窗，
                 # 因此每轮都（重新）打开弹窗，获取全新的验证组件
+                driver.execute_script("window.__checkinResponses = [];")
                 if not _modal_open(driver):
                     _open_captcha_modal(driver)
-                if not _solve_captcha(driver):
-                    raise RuntimeError("人机验证组件未出现")
-                result = _click_confirm(driver)
+
+                if _checkin_response_ready(driver) and not _modal_open(driver):
+                    # 签到按钮直提：点击后已产生 POST 响应
+                    result = _take_checkin_response(driver)
+                    logger.info("签到按钮直提，已捕获 POST 响应")
+                elif _modal_open(driver):
+                    if not _solve_captcha(driver):
+                        if _checkin_response_ready(driver):
+                            result = _take_checkin_response(driver)
+                        else:
+                            raise RuntimeError("人机验证组件未出现")
+                    else:
+                        result = _click_confirm(driver)
+                else:
+                    # 无弹窗无响应：站点未启用验证时可能不弹窗，直接 POST 兜底
+                    logger.info("无验证弹窗，尝试直接 POST /checkin")
+                    result = _post_checkin_direct(driver)
+                    if result is None:
+                        raise RuntimeError("人机验证弹窗未打开")
             except Exception as captcha_err:
                 last_detail = str(captcha_err)
                 _close_captcha_modal(driver)
