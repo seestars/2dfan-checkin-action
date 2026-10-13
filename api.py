@@ -2,9 +2,9 @@
 
 流程：启动 stealth Chrome → CDP 预置 session cookie → 打开 /checkin
      → 通过 Cloudflare（Turnstile 由 uc 伪装 + 有头模式自动解决）
-     → 读取 status.json → 点击签到（直提或弹窗）
+     → 读取 status.json → 先完成页面级 Turnstile（若有）→ 点击签到
      → 弹窗时完成人机验证（Turnstile / 阿里云滑块；站点未启用验证则跳过）
-     → 点击确认提交 POST /checkin（页面内 hook 捕获响应）
+     → 提交 POST /checkin（页面内 hook 捕获响应；422 需验证时自动补验后重提）
 
 签到页面为 Vue（Naive UI）应用，签到接口：
     GET  /checkin/status.json   签到状态（checked / serial_checkins / checkins_count ...）
@@ -133,7 +133,7 @@ fetch(path, {
 ).catch(e => cb({status: 0, body: String(e)}));
 """
 
-# 无弹窗场景直接 POST /checkin（站点未启用人机验证时接受空 JSON）
+# 无弹窗场景直接 POST /checkin；若页面已有 Turnstile token 则一并带上
 _DIRECT_POST_JS = """
 const cb = arguments[arguments.length - 1];
 const meta = document.querySelector('meta[name="csrf-token"]');
@@ -143,31 +143,53 @@ const headers = {
     'X-Requested-With': 'XMLHttpRequest'
 };
 if (meta && meta.content) headers['X-CSRF-Token'] = meta.content;
+const body = {};
+const ts = document.querySelector(
+    'input[name="cf-turnstile-response"], input[id*="cf-chl"][id$="_response"]'
+);
+if (ts && ts.value) body['cf-turnstile-response'] = ts.value;
+const aliyun = document.querySelector('input[name="aliyun_captcha_verify_param"]');
+if (aliyun && aliyun.value) body['aliyun_captcha_verify_param'] = aliyun.value;
 fetch('/checkin', {
     method: 'POST',
     headers: headers,
     credentials: 'same-origin',
-    body: JSON.stringify({})
+    body: JSON.stringify(body)
 }).then(r => r.text().then(body => cb({status: r.status, body: body}))
 ).catch(e => cb({status: 0, body: String(e)}));
 """
 
 # 人机验证组件状态（captchaPresent 为假表示站点暂未启用验证，可直接确认）
+# 新版 Cloudflare widget 用 cf-chl-widget-* 命名，id 不含 "turnstile"；
+# token 输入框存在（哪怕 value 为空）即视为验证组件已挂载。
 _CAPTCHA_STATE_JS = """
-const ts = document.querySelector('input[name="cf-turnstile-response"]');
+const ts = document.querySelector(
+    'input[name="cf-turnstile-response"], input[id*="cf-chl"][id$="_response"]'
+);
 const slider = document.getElementById('aliyunCaptcha-sliding-slider');
 const sr = slider ? slider.getBoundingClientRect() : null;
-const tsIframe = [...document.querySelectorAll('iframe')]
-    .some(x => x.src.includes('challenges.cloudflare.com'));
+const tsWidget = !!document.querySelector(
+    '[id*="turnstile"], [class*="turnstile"], [class*="cf-turnstile"]'
+    + ', [id*="cf-chl"], [class*="cf-chl"], [data-sitekey]'
+);
+const tsIframe = [...document.querySelectorAll('iframe')].some(x => {
+    const s = x.src || '';
+    return s.includes('challenges.cloudflare.com')
+        || s.includes('turnstile')
+        || (x.id || '').includes('turnstile')
+        || (x.id || '').includes('cf-chl')
+        || String(x.className || '').includes('turnstile');
+});
 return {
     turnstileToken: ts ? ts.value : null,
     sliderVisible: !!(sr && sr.width > 0 && sr.height > 0),
     modalMounted: !!document.querySelector('.n-modal'),
     captchaPresent: !!(
         document.querySelector('.captcha-render-area')
+        || tsWidget
         || tsIframe
         || (sr && sr.width > 0 && sr.height > 0)
-        || (ts && ts.value)
+        || ts
     )
 };
 """
@@ -187,12 +209,53 @@ return {
 };
 """
 
-# Turnstile widget iframe 位置（checkbox 在 iframe 内左侧约 30px）
+# Turnstile widget 位置（checkbox 在 widget 内左侧约 30px）
+# 新版 widget 容器 id 形如 cf-chl-widget-XXXX（响应 input 为 ..._response）
 _TURNSTILE_RECT_JS = """
-const f = [...document.querySelectorAll('iframe')]
-    .find(x => x.src.includes('challenges.cloudflare.com'));
-if (!f) return null;
-const r = f.getBoundingClientRect();
+const input = document.querySelector(
+    'input[name="cf-turnstile-response"], input[id*="cf-chl"][id$="_response"]'
+);
+let c = document.querySelector(
+    '[id^="cf-chl-widget"]:not([id$="_response"])'
+);
+if (!c && input) {
+    // 沿 input 向上找尺寸接近 Turnstile 的盒子（约 300×65）
+    let p = input.parentElement;
+    while (p && p !== document.body) {
+        const r = p.getBoundingClientRect();
+        if (r.width > 180 && r.width < 500 && r.height > 40 && r.height < 120) {
+            c = p;
+            break;
+        }
+        p = p.parentElement;
+    }
+    if (!c) c = input.parentElement;
+}
+if (!c) {
+    c = document.querySelector(
+        '.cf-turnstile, [data-sitekey]'
+        + ', [id*="turnstile"], [class*="cf-turnstile"], [id*="cf-chl"]'
+    );
+}
+if (!c) {
+    c = [...document.querySelectorAll('iframe')].find(x => {
+        const s = x.src || '';
+        return s.includes('challenges.cloudflare.com')
+            || s.includes('turnstile')
+            || (x.id || '').includes('cf-chl');
+    });
+}
+if (!c) {
+    // 可见 iframe 兜底（src 可能为空，用尺寸识别 Turnstile）
+    c = [...document.querySelectorAll('iframe')].find(x => {
+        const r = x.getBoundingClientRect();
+        return r.width > 180 && r.height > 40 && r.height < 140;
+    });
+}
+if (!c) return null;
+c.scrollIntoView && c.scrollIntoView({block: 'center'});
+const r = c.getBoundingClientRect();
+if (r.width <= 0 || r.height <= 0) return null;
 return {x: r.x, y: r.y, w: r.width, h: r.height};
 """
 
@@ -304,18 +367,22 @@ def _cdp_mouse(driver, mtype: str, x: float, y: float) -> None:
 
 
 def _click_turnstile_checkbox(driver) -> bool:
-    """点击 Turnstile widget 复选框（iframe 内左侧约 30px、垂直居中）。"""
+    """点击 Turnstile widget 复选框（widget 内左侧约 30px、垂直居中）。"""
     rect = driver.execute_script(_TURNSTILE_RECT_JS)
     if not rect or rect["w"] <= 0 or rect["h"] <= 0:
+        logger.info("未定位到 Turnstile widget")
         return False
     x = rect["x"] + 30
     y = rect["y"] + rect["h"] / 2
+    logger.info(
+        "点击 Turnstile 复选框 @(%.0f,%.0f) widget=(%.0f,%.0f %.0fx%.0f)",
+        x, y, rect["x"], rect["y"], rect["w"], rect["h"],
+    )
     _cdp_mouse(driver, "mouseMoved", x, y)
     time.sleep(random.uniform(0.1, 0.25))
     _cdp_mouse(driver, "mousePressed", x, y)
     time.sleep(random.uniform(0.05, 0.12))
     _cdp_mouse(driver, "mouseReleased", x, y)
-    logger.info("已点击 Turnstile 复选框")
     return True
 
 
@@ -580,6 +647,48 @@ def _post_checkin_direct(driver) -> dict | None:
     return {"status": raw["status"], "body": raw["body"], "reqBody": None, "json": data}
 
 
+def _wait_page_turnstile(driver, timeout: int = 20) -> bool:
+    """确保页面级 Turnstile 已通过（token 就绪）再签到。
+
+    服务端对陌生 IP（如 GitHub Actions）强制要求 cf-turnstile-response；
+    组件是页面上的「Verify you are human」复选框，必须先点掉拿到 token。
+    页面无 Turnstile 组件时视为无需验证，直接返回 True。
+    """
+    # 先快速判断有无验证组件（组件可能仍在挂载，短等 1.5s 再确认）
+    time.sleep(1.5)
+    state = driver.execute_script(_CAPTCHA_STATE_JS)
+    if (
+        not state.get("captchaPresent")
+        and not state.get("sliderVisible")
+        and not state.get("turnstileToken")
+    ):
+        logger.info("页面无 Turnstile/验证组件，视为无需验证")
+        return True
+    if state.get("turnstileToken"):
+        logger.info("页面 Turnstile token 已就绪")
+        return True
+
+    clicks = 0
+    for sec in range(timeout):
+        state = driver.execute_script(_CAPTCHA_STATE_JS)
+        if state.get("turnstileToken"):
+            logger.info("页面 Turnstile token 已就绪（%ds）", sec)
+            return True
+        if state.get("sliderVisible"):
+            logger.info("页面出现阿里云滑块，自动拖动")
+            _drag_slider(driver)
+            return True
+        if clicks < 2 and sec in (1, 8):
+            if _click_turnstile_checkbox(driver):
+                clicks += 1
+        if sec % 5 == 0:
+            logger.info("等待页面 Turnstile... (%d/%ds)", sec, timeout)
+        time.sleep(1)
+    logger.info("页面 Turnstile 等待超时（%ds）", timeout)
+    _log_captcha_dom(driver)
+    return False
+
+
 def _open_captcha_modal(driver) -> bool:
     """点击签到页「签到」按钮。
 
@@ -590,6 +699,7 @@ def _open_captcha_modal(driver) -> bool:
     btns = driver.find_elements(By.CSS_SELECTOR, "button.n-button--large-type")
     if not btns:
         raise RuntimeError("找不到签到按钮，页面可能未正确加载")
+    _wait_page_turnstile(driver)
     try:
         btns[0].click()
     except WebDriverException:
@@ -704,6 +814,83 @@ def _log_captcha_net(driver) -> None:
         )
 
 
+_CAPTCHA_DOM_JS = """
+const pick = (sel) => [...document.querySelectorAll(sel)].map(e => ({
+    tag: e.tagName, id: e.id,
+    cls: String(e.className).slice(0, 80),
+    text: (e.textContent || '').trim().slice(0, 40),
+    visible: !!(e.offsetWidth || e.offsetHeight),
+    valLen: e.value ? String(e.value).length : 0
+}));
+return {
+    turnstileInputs: pick('input[name="cf-turnstile-response"], input[id*="cf-chl"]'),
+    widgets: pick('[id^="cf-chl-widget"], .cf-turnstile, [data-sitekey]'),
+    iframes: [...document.querySelectorAll('iframe')].map(f => {
+        const r = f.getBoundingClientRect();
+        return {src: (f.src || '').slice(0, 80), id: f.id, w: r.width, h: r.height};
+    }),
+    captcha: pick('.captcha-render-area, .n-modal, [id*="captcha"], [id*="aliyun"]'),
+    largeBtns: pick('button.n-button--large-type')
+};
+"""
+
+
+def _log_captcha_dom(driver) -> None:
+    """输出页面验证相关 DOM 摘要，便于区分「无验证」和「验证未加载」。"""
+    try:
+        info = driver.execute_script(_CAPTCHA_DOM_JS) or {}
+    except WebDriverException as e:
+        logger.warning("读取验证 DOM 失败: %s", e)
+        return
+    logger.info("验证 DOM: %s", json.dumps(info, ensure_ascii=False)[:500])
+
+
+def _wait_required_captcha(driver) -> bool:
+    """服务端返回 422「请完成验证」后，等待并完成验证组件。
+
+    覆盖页面级 Turnstile 复选框（截图里那类「Verify you are human」）
+    以及弹窗内验证；组件可能在首次失败后才挂载。
+    """
+    logger.info("服务端要求验证，等待验证组件挂载...")
+    retried = False
+    clicks = 0
+    for sec in range(_CAPTCHA_WAIT):
+        state = driver.execute_script(_CAPTCHA_STATE_JS)
+        if state.get("turnstileToken"):
+            logger.info("Turnstile token 已就绪（%ds）", sec)
+            return True
+        if state.get("sliderVisible"):
+            logger.info("出现阿里云滑块（%ds）", sec)
+            _drag_slider(driver)
+            return True
+        if state.get("modalMounted") and state.get("captchaPresent"):
+            logger.info("验证弹窗已挂载（%ds），开始求解", sec)
+            return _solve_captcha(driver)
+        # 页面级 Turnstile 复选框（不在弹窗内）
+        if state.get("captchaPresent") and not state.get("modalMounted"):
+            if clicks < 2 and sec in (1, 8):
+                if _click_turnstile_checkbox(driver):
+                    clicks += 1
+        # 422 后页面可能只弹提示；再点一次签到以唤起验证弹窗
+        if not retried and sec == 10:
+            retried = True
+            try:
+                btns = driver.find_elements(
+                    By.CSS_SELECTOR, "button.n-button--large-type"
+                )
+                if btns and not btns[0].get_attribute("disabled"):
+                    logger.info("未见验证组件，再次点击签到按钮唤起验证")
+                    btns[0].click()
+            except WebDriverException:
+                pass
+        if sec % 5 == 0:
+            _log_captcha_dom(driver)
+            logger.info("等待验证组件... (%d/%ds)", sec, _CAPTCHA_WAIT)
+        time.sleep(1)
+    _log_captcha_dom(driver)
+    return False
+
+
 # ── 主入口 ───────────────────────────────────────────────────────
 
 
@@ -781,10 +968,11 @@ def checkin(user_id: str, session_cookie: str) -> CheckinResult | None:
         logger.info("页面: %s", driver.current_url)
         status = _get_status(driver)
         logger.info(
-            "签到状态: checked=%s 连续=%s 累计=%s",
+            "签到状态: checked=%s 连续=%s 累计=%s skip_captcha=%s",
             status.get("checked"),
             status.get("serial_checkins"),
             status.get("checkins_count"),
+            status.get("skip_captcha"),
         )
 
         if status.get("checked"):
@@ -819,6 +1007,35 @@ def checkin(user_id: str, session_cookie: str) -> CheckinResult | None:
                     result = _post_checkin_direct(driver)
                     if result is None:
                         raise RuntimeError("人机验证弹窗未打开")
+
+                # 服务端要求验证但未带上 token：等待并完成验证后重新确认
+                if (
+                    result
+                    and result["status"] == 422
+                    and "验证" in str(result.get("body") or "")
+                ):
+                    logger.info("提交被拒（422 需验证）: %s", result.get("body"))
+                    if _wait_required_captcha(driver):
+                        if _modal_open(driver):
+                            result = _click_confirm(driver) or result
+                        else:
+                            # 页面级 Turnstile 已就绪：重新提交（body 带 token）
+                            logger.info("Turnstile 已就绪，重新提交签到")
+                            driver.execute_script("window.__checkinResponses = [];")
+                            _open_captcha_modal(driver)
+                            if _checkin_response_ready(driver):
+                                result = _take_checkin_response(driver)
+                            # 按钮未带 token 时用直提（显式写入 cf-turnstile-response）
+                            if not (
+                                result
+                                and result["status"] == 200
+                                and result.get("json")
+                            ):
+                                direct = _post_checkin_direct(driver)
+                                if direct:
+                                    result = direct
+                    else:
+                        _log_captcha_dom(driver)
             except Exception as captcha_err:
                 last_detail = str(captcha_err)
                 _close_captcha_modal(driver)
@@ -848,10 +1065,12 @@ def checkin(user_id: str, session_cookie: str) -> CheckinResult | None:
                 return fallback
 
             detail = _summarize_submit(result) if result else last_detail
+            last_detail = detail
             logger.warning(
                 "提交失败（%d/%d）: %s", round_, _SUBMIT_RETRIES, detail
             )
-            _close_captcha_modal(driver)
+            if not result:
+                _close_captcha_modal(driver)
 
         _log_captcha_net(driver)
         raise RuntimeError(f"签到提交多次失败: {last_detail}")
